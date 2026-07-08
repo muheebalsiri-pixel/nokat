@@ -1,0 +1,48 @@
+name: Telegram Forwarder
+
+on:
+  schedule:
+    # يعمل كل ساعة تماماً (وقت GitHub قد يتأخر بضع دقائق أحياناً،
+    # لذا يفضّل أيضاً تشغيله عبر cron-job.org باستخدام workflow_dispatch)
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: telegram-forwarder
+  cancel-in-progress: false
+
+jobs:
+  forward:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run forwarder
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TARGET_CHANNEL: ${{ secrets.TARGET_CHANNEL }}
+        run: python forwarder.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "تحديث الحالة [skip ci]"
+          git push
