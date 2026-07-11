@@ -27,6 +27,7 @@ SOURCE_CHANNELS = [
     "noktah2023",
     "ggbbaaa2023",
     "HHHB50H",
+    "a_altamiimii",
 ]
 
 # ============ إعدادات الفحص ============
