@@ -188,6 +188,42 @@ def send_media(file_bytes, filename, caption, media_kind):
     return resp.ok, resp.text
 
 
+def send_media_group(media_list):
+    """إرسال مجموعة وسائط (ألبوم) عبر البوت"""
+    url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMediaGroup"
+    
+    chat_id = (
+        f"@{config.TARGET_CHANNEL}"
+        if not config.TARGET_CHANNEL.lstrip("-").isdigit()
+        else config.TARGET_CHANNEL
+    )
+    
+    files = {}
+    media_json = []
+    
+    for i, item in enumerate(media_list):
+        attach_name = f"media_{i}"
+        files[attach_name] = (item["filename"], item["bytes"])
+        
+        media_entry = {
+            "type": item["media_kind"],
+            "media": f"attach://{attach_name}"
+        }
+        # التلجرام يقبل الشرح (caption) على عناصر الألبوم وعادةً نضعه على العنصر الأول أو حيثما وجد النص
+        if item["caption"]:
+            media_entry["caption"] = item["caption"]
+            
+        media_json.append(media_entry)
+        
+    data = {
+        "chat_id": chat_id,
+        "media": json.dumps(media_json)
+    }
+    
+    resp = requests.post(url, data=data, files=files, timeout=180)
+    return resp.ok, resp.text
+
+
 def detect_media_kind(message):
     if message.photo:
         return "photo"
@@ -213,71 +249,182 @@ async def process_channel(client, channel_username, state, since):
         log(f"  خطأ: تعذر الوصول للقناة {channel_username}: {e}")
         return sent_count, skipped_count
 
-    async for message in client.iter_messages(
-        entity, limit=config.MESSAGES_PER_CHANNEL
-    ):
-        if message.date is None or message.date < since:
-            continue
+    # جلب الرسائل أولاً لتجميع الألبومات بناءً على grouped_id
+    raw_messages = []
+    async for message in client.iter_messages(entity, limit=config.MESSAGES_PER_CHANNEL):
+        raw_messages.append(message)
 
-        if message.id in channel_ids:
-            continue
+    # تجميع الرسائل التي تنتمي لنفس الألبوم
+    # المفتاح: grouped_id، القيمة: قائمة الرسائل التابعة له
+    albums = {}
+    # قائمة لحفظ الترتيب الأصلي للرسائل (الفردية والألبومات مجتمعة ككتل)
+    processed_blocks = []
+    seen_groups = set()
 
-        # نعتبر الرسالة "مفحوصة" بغض النظر عن نتيجة الفلترة كي لا نعيد فحصها لاحقاً
-        channel_ids.add(message.id)
+    for msg in raw_messages:
+        if msg.grouped_id:
+            if msg.grouped_id not in albums:
+                albums[msg.grouped_id] = []
+            albums[msg.grouped_id].append(msg)
+            if msg.grouped_id not in seen_groups:
+                processed_blocks.append(("album", msg.grouped_id))
+                seen_groups.add(msg.grouped_id)
+        else:
+            processed_blocks.append(("single", msg))
 
-        skip, reason = should_skip(message)
-        if skip:
-            skipped_count += 1
-            log(f"  [تجاهل] {channel_username}#{message.id}: {reason}")
-            continue
-
-        text = message.raw_text or ""
-        h = content_hash(text) if text else None
-
-        if h and h in state.get("content_hashes", {}):
-            skipped_count += 1
-            log(f"  [تجاهل] {channel_username}#{message.id}: محتوى مكرر (قناة أخرى)")
-            continue
-
-        media_kind = detect_media_kind(message)
-        
-        # فلتر لحجم الفيديو لحماية الخطة المجانية (أقل من 3 ميجابايت)
-        if media_kind == "video" and message.video:
-            # حجم الفيديو بالبايت، 3 ميجابايت = 3 * 1024 * 1024
-            if message.video.size > 3 * 1024 * 1024:
-                skipped_count += 1
-                log(f"  [تجاهل] {channel_username}#{message.id}: حجم الفيديو أكبر من 3 ميجابايت ({round(message.video.size / (1024*1024), 2)} MB)")
+    # معالجة الكتل بالترتيب المجلوب
+    for block_type, block_data in processed_blocks:
+        if block_type == "single":
+            message = block_data
+            
+            if message.date is None or message.date < since:
+                continue
+            if message.id in channel_ids:
                 continue
 
-        ok = False
+            channel_ids.add(message.id)
 
-        try:
-            if media_kind:
-                buf = io.BytesIO()
-                await client.download_media(message, file=buf)
-                buf.seek(0)
-                filename = f"{channel_username}_{message.id}"
-                ok, resp_text = send_media(buf, filename, text, media_kind)
-            elif text:
-                ok, resp_text = send_text(text)
-            else:
+            skip, reason = should_skip(message)
+            if skip:
                 skipped_count += 1
+                log(f"  [تجاهل] {channel_username}#{message.id}: {reason}")
                 continue
 
-            if ok:
-                sent_count += 1
-                log(f"  [تم النشر] {channel_username}#{message.id}")
-                if h:
-                    state.setdefault("content_hashes", {})[h] = datetime.now(
-                        timezone.utc
-                    ).isoformat()
-            else:
-                log(f"  [فشل الإرسال] {channel_username}#{message.id}: {resp_text}")
+            text = message.raw_text or ""
+            h = content_hash(text) if text else None
 
-        except Exception as e:
-            log(f"  [خطأ أثناء الإرسال] {channel_username}#{message.id}: {e}")
+            if h and h in state.get("content_hashes", {}):
+                skipped_count += 1
+                log(f"  [تجاهل] {channel_username}#{message.id}: محتوى مكرر (قناة أخرى)")
+                continue
 
-        await asyncio.sleep(1.5)  # تجنّب حدود Telegram API
+            media_kind = detect_media_kind(message)
+            
+            if media_kind == "video" and message.video:
+                if message.video.size > 3 * 1024 * 1024:
+                    skipped_count += 1
+                    log(f"  [تجاهل] {channel_username}#{message.id}: حجم الفيديو أكبر من 3 ميجابايت ({round(message.video.size / (1024*1024), 2)} MB)")
+                    continue
+
+            ok = False
+            try:
+                if media_kind:
+                    buf = io.BytesIO()
+                    await client.download_media(message, file=buf)
+                    buf.seek(0)
+                    filename = f"{channel_username}_{message.id}"
+                    ok, resp_text = send_media(buf, filename, text, media_kind)
+                elif text:
+                    ok, resp_text = send_text(text)
+                else:
+                    skipped_count += 1
+                    continue
+
+                if ok:
+                    sent_count += 1
+                    log(f"  [تم النشر] {channel_username}#{message.id}")
+                    if h:
+                        state.setdefault("content_hashes", {})[h] = datetime.now(timezone.utc).isoformat()
+                else:
+                    log(f"  [فشل الإرسال] {channel_username}#{message.id}: {resp_text}")
+
+            except Exception as e:
+                log(f"  [خطأ أثناء الإرسال] {channel_username}#{message.id}: {e}")
+
+            await asyncio.sleep(1.5)
+
+        elif block_type == "album":
+            grouped_id = block_data
+            # رسائل الألبوم الواحد تأتي مرتبة عكسياً من الأحدث للأقدم، نعيد ترتيبها لتصبح من الأقدم للأحدث (الترتيب الطبيعي للألبوم)
+            album_messages = sorted(albums[grouped_id], key=lambda m: m.id)
+            
+            # التحقق مما إذا كانت كل رسائل الألبوم قد تم معالجتها سابقاً أو خارج النطاق الزمني
+            valid_album_messages = []
+            skip_album = False
+            skip_reason = ""
+
+            for msg in album_messages:
+                if msg.date is None or msg.date < since:
+                    continue
+                if msg.id in channel_ids:
+                    continue
+                
+                channel_ids.add(msg.id)
+                
+                # فحص الفلاتر لكل رسالة داخل الألبوم
+                skip, reason = should_skip(msg)
+                if skip:
+                    skip_album = True
+                    skip_reason = f"أحد عناصر الألبوم تم استبعاده بسبب: {reason}"
+                    break
+                
+                text = msg.raw_text or ""
+                h = content_hash(text) if text else None
+                if h and h in state.get("content_hashes", {}):
+                    skip_album = True
+                    skip_reason = "محتوى نص الألبوم مكرر (قناة أخرى)"
+                    break
+                
+                media_kind = detect_media_kind(msg)
+                # لا يمكن إرسال ألبوم يحتوي على مستندات أو صوتيات مختلطة بالصور/الفيديو عبر البوت بسهولة، ويفضل فقط photo و video للألبومات الرياضية
+                if media_kind not in ("photo", "video"):
+                    skip_album = True
+                    skip_reason = f"نوع وسائط غير مدعوم في الألبومات المجمعة ({media_kind})"
+                    break
+                    
+                if media_kind == "video" and msg.video:
+                    if msg.video.size > 3 * 1024 * 1024:
+                        skip_album = True
+                        skip_reason = f"أحد فيديوهات الألبوم أكبر من 3 ميجابايت ({round(msg.video.size / (1024*1024), 2)} MB)"
+                        break
+                
+                valid_album_messages.append(msg)
+
+            if skip_album:
+                skipped_count += len(album_messages)
+                log(f"  [تجاهل ألبوم] {channel_username} (Group: {grouped_id}): {skip_reason}")
+                continue
+
+            if not valid_album_messages:
+                continue
+
+            # تنزيل وسائط الألبوم وتجهيزها للإرسال الجماعي
+            media_to_send = []
+            main_hash = None
+            try:
+                for msg in valid_album_messages:
+                    text = msg.raw_text or ""
+                    if text and not main_hash:
+                        main_hash = content_hash(text)
+                        
+                    media_kind = detect_media_kind(msg)
+                    buf = io.BytesIO()
+                    await client.download_media(msg, file=buf)
+                    buf.seek(0)
+                    filename = f"{channel_username}_{msg.id}"
+                    
+                    media_to_send.append({
+                        "bytes": buf,
+                        "filename": filename,
+                        "caption": text,
+                        "media_kind": media_kind
+                    })
+
+                # إرسال الألبوم بالكامل
+                ok, resp_text = send_media_group(media_to_send)
+                
+                if ok:
+                    sent_count += 1 # نحسبها عملية نشر واحدة كألبوم
+                    log(f"  [تم نشر ألبوم بالكامل] {channel_username} (Group: {grouped_id}) يحتوي على {len(media_to_send)} عناصر")
+                    if main_hash:
+                        state.setdefault("content_hashes", {})[main_hash] = datetime.now(timezone.utc).isoformat()
+                else:
+                    log(f"  [فشل إرسال الألبوم] {channel_username} (Group: {grouped_id}): {resp_text}")
+                    
+            except Exception as e:
+                log(f"  [خطأ أثناء إرسال الألبوم] {channel_username} (Group: {grouped_id}): {e}")
+
+            await asyncio.sleep(2.0)
 
     forwarded_ids[channel_username] = list(channel_ids)
     return sent_count, skipped_count
