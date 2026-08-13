@@ -26,7 +26,6 @@ SOURCE_CHANNELS = [
     "DT_0G",
     "noktah2023",
     "ggbbaaa2023",
-    "HHHB50H",
     "a_altamiimii",
     "H00H900",
     "y2y2_88",
