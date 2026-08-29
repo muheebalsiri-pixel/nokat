@@ -65,9 +65,19 @@ def prune_content_hashes(state):
 
 
 def prune_forwarded_ids(state):
+    """
+    لا نحذف forwarded_ids القديمة.
+
+    السبب:
+    حذف المعرّفات القديمة قد يؤدي إلى إعادة نشر رسالة سبق نقلها
+    إذا كانت لا تزال ضمن نافذة الفحص HOURS_WINDOW.
+
+    لذلك يتم الاحتفاظ بجميع message IDs التي تم نقلها بنجاح،
+    بينما يبقى content_hashes خاضعاً للتنظيف الزمني كالمعتاد.
+    """
     for ch, ids in state.get("forwarded_ids", {}).items():
-        if len(ids) > config.MAX_STORED_IDS_PER_CHANNEL:
-            state["forwarded_ids"][ch] = ids[-config.MAX_STORED_IDS_PER_CHANNEL :]
+        # إزالة التكرارات داخل القائمة نفسها مع الحفاظ على ترتيبها
+        state["forwarded_ids"][ch] = list(dict.fromkeys(ids))
 
 
 def normalize_text(text):
@@ -191,35 +201,36 @@ def send_media(file_bytes, filename, caption, media_kind):
 def send_media_group(media_list):
     """إرسال مجموعة وسائط (ألبوم) عبر البوت"""
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMediaGroup"
-    
+
     chat_id = (
         f"@{config.TARGET_CHANNEL}"
         if not config.TARGET_CHANNEL.lstrip("-").isdigit()
         else config.TARGET_CHANNEL
     )
-    
+
     files = {}
     media_json = []
-    
+
     for i, item in enumerate(media_list):
         attach_name = f"media_{i}"
         files[attach_name] = (item["filename"], item["bytes"])
-        
+
         media_entry = {
             "type": item["media_kind"],
             "media": f"attach://{attach_name}"
         }
+
         # التلجرام يقبل الشرح (caption) على عناصر الألبوم وعادةً نضعه على العنصر الأول أو حيثما وجد النص
         if item["caption"]:
             media_entry["caption"] = item["caption"]
-            
+
         media_json.append(media_entry)
-        
+
     data = {
         "chat_id": chat_id,
         "media": json.dumps(media_json)
     }
-    
+
     resp = requests.post(url, data=data, files=files, timeout=180)
     return resp.ok, resp.text
 
@@ -257,6 +268,7 @@ async def process_channel(client, channel_username, state, since):
     # تجميع الرسائل التي تنتمي لنفس الألبوم
     # المفتاح: grouped_id، القيمة: قائمة الرسائل التابعة له
     albums = {}
+
     # قائمة لحفظ الترتيب الأصلي للرسائل (الفردية والألبومات مجتمعة ككتل)
     processed_blocks = []
     seen_groups = set()
@@ -266,6 +278,7 @@ async def process_channel(client, channel_username, state, since):
             if msg.grouped_id not in albums:
                 albums[msg.grouped_id] = []
             albums[msg.grouped_id].append(msg)
+
             if msg.grouped_id not in seen_groups:
                 processed_blocks.append(("album", msg.grouped_id))
                 seen_groups.add(msg.grouped_id)
@@ -276,13 +289,14 @@ async def process_channel(client, channel_username, state, since):
     for block_type, block_data in processed_blocks:
         if block_type == "single":
             message = block_data
-            
+
             if message.date is None or message.date < since:
                 continue
-            if message.id in channel_ids:
-                continue
 
-            channel_ids.add(message.id)
+            # منع إعادة إرسال الرسالة التي سبق نقلها
+            if message.id in channel_ids:
+                log(f"  [تجاهل] {channel_username}#{message.id}: تم نقلها سابقاً")
+                continue
 
             skip, reason = should_skip(message)
             if skip:
@@ -296,14 +310,24 @@ async def process_channel(client, channel_username, state, since):
             if h and h in state.get("content_hashes", {}):
                 skipped_count += 1
                 log(f"  [تجاهل] {channel_username}#{message.id}: محتوى مكرر (قناة أخرى)")
+
+                # تسجيلها كمعالجة داخل التشغيل الحالي لمنع فحصها مرة أخرى
+                channel_ids.add(message.id)
                 continue
 
             media_kind = detect_media_kind(message)
-            
+
             if media_kind == "video" and message.video:
                 if message.video.size > 3 * 1024 * 1024:
                     skipped_count += 1
-                    log(f"  [تجاهل] {channel_username}#{message.id}: حجم الفيديو أكبر من 3 ميجابايت ({round(message.video.size / (1024*1024), 2)} MB)")
+                    log(
+                        f"  [تجاهل] {channel_username}#{message.id}: "
+                        f"حجم الفيديو أكبر من 3 ميجابايت "
+                        f"({round(message.video.size / (1024*1024), 2)} MB)"
+                    )
+
+                    # لا نعتبرها منشورة، لكن لا نعيد فحصها داخل نفس التشغيل
+                    channel_ids.add(message.id)
                     continue
 
             ok = False
@@ -312,33 +336,63 @@ async def process_channel(client, channel_username, state, since):
                     buf = io.BytesIO()
                     await client.download_media(message, file=buf)
                     buf.seek(0)
+
                     filename = f"{channel_username}_{message.id}"
-                    ok, resp_text = send_media(buf, filename, text, media_kind)
+                    ok, resp_text = send_media(
+                        buf,
+                        filename,
+                        text,
+                        media_kind
+                    )
+
                 elif text:
                     ok, resp_text = send_text(text)
+
                 else:
                     skipped_count += 1
+                    channel_ids.add(message.id)
                     continue
 
                 if ok:
                     sent_count += 1
+
+                    # مهم:
+                    # تسجيل الرسالة في الذاكرة مباشرة بعد نجاح الإرسال
+                    # بدلاً من تسجيلها فقط في نهاية التشغيل.
+                    channel_ids.add(message.id)
+
                     log(f"  [تم النشر] {channel_username}#{message.id}")
+
                     if h:
-                        state.setdefault("content_hashes", {})[h] = datetime.now(timezone.utc).isoformat()
+                        state.setdefault("content_hashes", {})[
+                            h
+                        ] = datetime.now(timezone.utc).isoformat()
+
                 else:
-                    log(f"  [فشل الإرسال] {channel_username}#{message.id}: {resp_text}")
+                    log(
+                        f"  [فشل الإرسال] {channel_username}#{message.id}: "
+                        f"{resp_text}"
+                    )
 
             except Exception as e:
-                log(f"  [خطأ أثناء الإرسال] {channel_username}#{message.id}: {e}")
+                log(
+                    f"  [خطأ أثناء الإرسال] {channel_username}#{message.id}: {e}"
+                )
 
             await asyncio.sleep(1.5)
 
         elif block_type == "album":
             grouped_id = block_data
-            # رسائل الألبوم الواحد تأتي مرتبة عكسياً من الأحدث للأقدم، نعيد ترتيبها لتصبح من الأقدم للأحدث (الترتيب الطبيعي للألبوم)
-            album_messages = sorted(albums[grouped_id], key=lambda m: m.id)
-            
-            # التحقق مما إذا كانت كل رسائل الألبوم قد تم معالجتها سابقاً أو خارج النطاق الزمني
+
+            # رسائل الألبوم الواحد تأتي مرتبة عكسياً من الأحدث للأقدم،
+            # نعيد ترتيبها لتصبح من الأقدم للأحدث (الترتيب الطبيعي للألبوم)
+            album_messages = sorted(
+                albums[grouped_id],
+                key=lambda m: m.id
+            )
+
+            # التحقق مما إذا كانت كل رسائل الألبوم قد تم معالجتها سابقاً
+            # أو خارج النطاق الزمني
             valid_album_messages = []
             skip_album = False
             skip_reason = ""
@@ -346,43 +400,62 @@ async def process_channel(client, channel_username, state, since):
             for msg in album_messages:
                 if msg.date is None or msg.date < since:
                     continue
+
                 if msg.id in channel_ids:
                     continue
-                
-                channel_ids.add(msg.id)
-                
+
+                # لا نضيف الرسالة إلى channel_ids هنا.
+                # تتم إضافتها فقط بعد نجاح إرسال الألبوم بالكامل.
+
                 # فحص الفلاتر لكل رسالة داخل الألبوم
                 skip, reason = should_skip(msg)
                 if skip:
                     skip_album = True
                     skip_reason = f"أحد عناصر الألبوم تم استبعاده بسبب: {reason}"
                     break
-                
+
                 text = msg.raw_text or ""
                 h = content_hash(text) if text else None
+
                 if h and h in state.get("content_hashes", {}):
                     skip_album = True
                     skip_reason = "محتوى نص الألبوم مكرر (قناة أخرى)"
                     break
-                
+
                 media_kind = detect_media_kind(msg)
-                # لا يمكن إرسال ألبوم يحتوي على مستندات أو صوتيات مختلطة بالصور/الفيديو عبر البوت بسهولة، ويفضل فقط photo و video للألبومات الرياضية
+
+                # لا يمكن إرسال ألبوم يحتوي على مستندات أو صوتيات مختلطة
+                # بالصور/الفيديو عبر البوت بسهولة، ويفضل فقط photo و video
+                # للألبومات الرياضية
                 if media_kind not in ("photo", "video"):
                     skip_album = True
-                    skip_reason = f"نوع وسائط غير مدعوم في الألبومات المجمعة ({media_kind})"
+                    skip_reason = (
+                        f"نوع وسائط غير مدعوم في الألبومات المجمعة "
+                        f"({media_kind})"
+                    )
                     break
-                    
+
                 if media_kind == "video" and msg.video:
                     if msg.video.size > 3 * 1024 * 1024:
                         skip_album = True
-                        skip_reason = f"أحد فيديوهات الألبوم أكبر من 3 ميجابايت ({round(msg.video.size / (1024*1024), 2)} MB)"
+                        skip_reason = (
+                            f"أحد فيديوهات الألبوم أكبر من 3 ميجابايت "
+                            f"({round(msg.video.size / (1024*1024), 2)} MB)"
+                        )
                         break
-                
+
                 valid_album_messages.append(msg)
 
             if skip_album:
                 skipped_count += len(album_messages)
-                log(f"  [تجاهل ألبوم] {channel_username} (Group: {grouped_id}): {skip_reason}")
+
+                # الرسائل المستبعدة لا تُسجل كرسائل منشورة.
+                # هذا يحافظ على السلوك الأصلي، مع منع إعادة تسجيل
+                # الرسائل التي كانت موجودة بالفعل في channel_ids.
+                log(
+                    f"  [تجاهل ألبوم] {channel_username} "
+                    f"(Group: {grouped_id}): {skip_reason}"
+                )
                 continue
 
             if not valid_album_messages:
@@ -391,18 +464,22 @@ async def process_channel(client, channel_username, state, since):
             # تنزيل وسائط الألبوم وتجهيزها للإرسال الجماعي
             media_to_send = []
             main_hash = None
+
             try:
                 for msg in valid_album_messages:
                     text = msg.raw_text or ""
+
                     if text and not main_hash:
                         main_hash = content_hash(text)
-                        
+
                     media_kind = detect_media_kind(msg)
+
                     buf = io.BytesIO()
                     await client.download_media(msg, file=buf)
                     buf.seek(0)
+
                     filename = f"{channel_username}_{msg.id}"
-                    
+
                     media_to_send.append({
                         "bytes": buf,
                         "filename": filename,
@@ -412,21 +489,43 @@ async def process_channel(client, channel_username, state, since):
 
                 # إرسال الألبوم بالكامل
                 ok, resp_text = send_media_group(media_to_send)
-                
+
                 if ok:
-                    sent_count += 1 # نحسبها عملية نشر واحدة كألبوم
-                    log(f"  [تم نشر ألبوم بالكامل] {channel_username} (Group: {grouped_id}) يحتوي على {len(media_to_send)} عناصر")
+                    sent_count += 1
+
+                    # مهم:
+                    # تسجيل جميع رسائل الألبوم كمُنقولة فقط بعد نجاح
+                    # إرسال الألبوم بالكامل.
+                    for msg in valid_album_messages:
+                        channel_ids.add(msg.id)
+
+                    log(
+                        f"  [تم نشر ألبوم بالكامل] {channel_username} "
+                        f"(Group: {grouped_id}) يحتوي على "
+                        f"{len(media_to_send)} عناصر"
+                    )
+
                     if main_hash:
-                        state.setdefault("content_hashes", {})[main_hash] = datetime.now(timezone.utc).isoformat()
+                        state.setdefault("content_hashes", {})[
+                            main_hash
+                        ] = datetime.now(timezone.utc).isoformat()
+
                 else:
-                    log(f"  [فشل إرسال الألبوم] {channel_username} (Group: {grouped_id}): {resp_text}")
-                    
+                    log(
+                        f"  [فشل إرسال الألبوم] {channel_username} "
+                        f"(Group: {grouped_id}): {resp_text}"
+                    )
+
             except Exception as e:
-                log(f"  [خطأ أثناء إرسال الألبوم] {channel_username} (Group: {grouped_id}): {e}")
+                log(
+                    f"  [خطأ أثناء إرسال الألبوم] {channel_username} "
+                    f"(Group: {grouped_id}): {e}"
+                )
 
             await asyncio.sleep(2.0)
 
     forwarded_ids[channel_username] = list(channel_ids)
+
     return sent_count, skipped_count
 
 
@@ -440,10 +539,15 @@ async def main():
         sys.exit(1)
 
     state = load_state()
-    since = datetime.now(timezone.utc) - timedelta(hours=config.HOURS_WINDOW)
+
+    since = datetime.now(timezone.utc) - timedelta(
+        hours=config.HOURS_WINDOW
+    )
 
     client = TelegramClient(
-        StringSession(config.SESSION_STRING), config.API_ID, config.API_HASH
+        StringSession(config.SESSION_STRING),
+        config.API_ID,
+        config.API_HASH
     )
 
     total_sent = 0
@@ -452,16 +556,28 @@ async def main():
     async with client:
         for channel in config.SOURCE_CHANNELS:
             log(f"فحص قناة: {channel}")
-            sent, skipped = await process_channel(client, channel, state, since)
+
+            sent, skipped = await process_channel(
+                client,
+                channel,
+                state,
+                since
+            )
+
             total_sent += sent
             total_skipped += skipped
 
     prune_content_hashes(state)
     prune_forwarded_ids(state)
+
     state["last_run"] = datetime.now(timezone.utc).isoformat()
+
     save_state(state)
 
-    log(f"انتهى التشغيل. تم النشر: {total_sent} | تم التجاهل: {total_skipped}")
+    log(
+        f"انتهى التشغيل. تم النشر: {total_sent} | "
+        f"تم التجاهل: {total_skipped}"
+    )
 
 
 if __name__ == "__main__":
