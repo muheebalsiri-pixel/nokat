@@ -152,6 +152,11 @@ def should_skip(message):
     if contains_banned_word(text):
         return True, "تحتوي كلمة ممنوعة"
 
+    if text:
+        words = text.strip().split()
+        if len(words) < 5:
+            return True, "النص يحتوي على أقل من 5 كلمات"
+
     if not text and not message.media:
         return True, "رسالة فارغة بدون نص أو وسائط"
 
